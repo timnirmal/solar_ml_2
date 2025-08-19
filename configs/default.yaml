@@ -1,0 +1,58 @@
+seed: 42
+runs_dir: runs
+project_name: solar_fault_detection
+
+data:
+  classification_root: data/classification
+  train_split: train
+  val_split: val
+  test_split: test
+  classes:
+    - clean
+    - dusty
+    - bird-drop
+    - electrical-damage
+    - physical-damage
+    - snow-covered
+
+training:
+  input_size: 299
+  batch_size: 16
+  num_workers: 4
+  max_epochs: 30
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  use_class_weights: true
+  use_focal_loss: false
+  label_smoothing: 0.0
+  early_stopping_patience: 7
+
+augment:
+  horizontal_flip: true
+  vertical_flip: false
+  color_jitter: true
+  jitter_params:
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+  blur: true
+  coarse_dropout: true
+
+model:
+  name: inception_v3_se
+  pretrained: true
+  freeze_until: mixed5  # set to null to not freeze
+  dropout: 0.2
+
+checkpointing:
+  keep_last_k: 3
+  monitor: val_macro_f1
+  mode: max
+
+logging:
+  log_every_n_steps: 50
+  save_confusion_matrix: true
+
+
+
