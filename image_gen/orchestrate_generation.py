@@ -2,11 +2,14 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
+import random
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 from PIL import Image
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 # Support running both as module (-m image_gen.orchestrate_generation) and as a script
 try:
@@ -66,33 +69,58 @@ def pick_reference_images(dataset_root: Path, class_name: str, max_images: int) 
     return imgs
 
 
-def generate_structural_consistency(class_name: str, out_dir: Path, num_images: int, models: GeminiModels) -> List[Path]:
+def generate_structural_consistency(dataset_root: Path, class_name: str, out_dir: Path, num_images: int, models: GeminiModels) -> List[Path]:
     ensure_dir(out_dir)
-    # Use base clean panels as structure reference if available
-    reference_paths = list((out_dir.parent.parent / "clean").rglob("*.jpg"))[: min(10, num_images)]
+    # Use cleaned images as structural references
+    clean_refs = pick_reference_images(dataset_root, "clean", max_images=max(1, min(25, num_images)))
+    if not clean_refs:
+        clean_refs = pick_reference_images(dataset_root, class_name, max_images=1)
     generated: List[Path] = []
-    for i in range(num_images):
-        instruction = f"apply '{class_name}' characteristics while preserving panel layout and scene geometry"
-        # Placeholder: we are not passing image+mask because of SDK constraints in this scaffolding
-        img_bytes = call_image_edit(Image.new("RGB", (1024, 1024), color=(255, 255, 255)), instruction, models=models)
-        out_path = out_dir / f"struct_{i:05d}.png"
-        out_path.write_bytes(img_bytes)
-        generated.append(out_path)
+    idx = 0
+    with tqdm(total=num_images, desc=f"SC->{class_name}", unit="img", leave=False) as pbar:
+        while len(generated) < num_images:
+            try:
+                ref_path = random.choice(clean_refs) if clean_refs else None
+                base_image = Image.open(ref_path).convert("RGB") if ref_path else Image.new("RGB", (1024, 1024), color=(255, 255, 255))
+                instruction = f"apply '{class_name}' characteristics while preserving panel layout and scene geometry"
+                img_bytes = call_image_edit(base_image, instruction, models=models)
+                out_path = out_dir / f"struct_{idx:05d}.png"
+                out_path.write_bytes(img_bytes)
+                generated.append(out_path)
+                idx += 1
+                pbar.update(1)
+            except Exception:
+                time.sleep(60)
+                continue
     return generated
 
 
 def generate_domain_adaptation(class_name: str, dataset_root: Path, out_dir: Path, num_images: int, models: GeminiModels) -> List[Path]:
     ensure_dir(out_dir)
-    # Pick a few example images from the target class to adapt style
-    ref_images = pick_reference_images(dataset_root, class_name, max_images=5)
-    prompt_prefix = f"Domain adapt to '{class_name}' conditions using reference style cues. High realism, solar panels visible."
+    # Pick source images from other classes
+    other_classes = [c for c in CLASS_NAMES if c != class_name]
+    other_images: List[Path] = []
+    for oc in other_classes:
+        other_images.extend(pick_reference_images(dataset_root, oc, max_images=50))
+    if not other_images:
+        other_images = pick_reference_images(dataset_root, class_name, max_images=10)
     generated: List[Path] = []
-    for i in range(num_images):
-        prompt = prompt_prefix
-        img_bytes = call_text_to_image(prompt, models=models)
-        out_path = out_dir / f"dom_{i:05d}.png"
-        out_path.write_bytes(img_bytes)
-        generated.append(out_path)
+    idx = 0
+    with tqdm(total=num_images, desc=f"DA->{class_name}", unit="img", leave=False) as pbar:
+        while len(generated) < num_images:
+            try:
+                src = random.choice(other_images) if other_images else None
+                base_image = Image.open(src).convert("RGB") if src else Image.new("RGB", (1024, 1024), color=(200, 200, 200))
+                instruction = f"convert the scene appearance to '{class_name}' while maintaining scene structure"
+                img_bytes = call_image_edit(base_image, instruction, models=models)
+                out_path = out_dir / f"dom_{idx:05d}.png"
+                out_path.write_bytes(img_bytes)
+                generated.append(out_path)
+                idx += 1
+                pbar.update(1)
+            except Exception:
+                time.sleep(60)
+                continue
     return generated
 
 
@@ -113,12 +141,20 @@ def generate_text_to_image(class_name: str, out_dir: Path, num_images: int, mode
     }
     condition = class_prompt_map.get(class_name, class_name)
     generated: List[Path] = []
-    for i in range(num_images):
-        prompt = f"{base_prompt} Condition: {condition}."
-        img_bytes = call_text_to_image(prompt, models=models)
-        out_path = out_dir / f"t2i_{i:05d}.png"
-        out_path.write_bytes(img_bytes)
-        generated.append(out_path)
+    idx = 0
+    with tqdm(total=num_images, desc=f"T2I->{class_name}", unit="img", leave=False) as pbar:
+        while len(generated) < num_images:
+            try:
+                prompt = f"{base_prompt} Condition: {condition}."
+                img_bytes = call_text_to_image(prompt, models=models)
+                out_path = out_dir / f"t2i_{idx:05d}.png"
+                out_path.write_bytes(img_bytes)
+                generated.append(out_path)
+                idx += 1
+                pbar.update(1)
+            except Exception:
+                time.sleep(60)
+                continue
     return generated
 
 
@@ -157,7 +193,7 @@ def orchestrate(dataset_root: Path, output_root: Path, targets: Dict[str, int], 
 
         manifest[class_name] = {"structural_consistency": [], "domain_adaptation": [], "text_to_image": []}
 
-        sc_paths = generate_structural_consistency(class_name, sc_dir, budgets.structural_consistency, models)
+        sc_paths = generate_structural_consistency(dataset_root, class_name, sc_dir, budgets.structural_consistency, models)
         manifest[class_name]["structural_consistency"] = [str(p) for p in sc_paths]
 
         da_paths = generate_domain_adaptation(class_name, dataset_root, da_dir, budgets.domain_adaptation, models)
@@ -189,8 +225,8 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, default=Path(__file__).resolve().parent.parent / "generated")
     parser.add_argument("--target-per-class", type=int, default=100)
     parser.add_argument("--classes", type=str, nargs="*", default=CLASS_NAMES)
-    parser.add_argument("--models-text", type=str, default="gemini-2.5-pro")
-    parser.add_argument("--models-image", type=str, default="gemini-2.5-pro")
+    parser.add_argument("--models-text", type=str, default="gemini-2.0-flash-preview-image-generation")
+    parser.add_argument("--models-image", type=str, default="gemini-2.0-flash-preview-image-generation")
     parser.add_argument("--ratio", type=str, default="50,30,20", help="Ratios for SC,DA,T2I in percentages (priority order)")
     parser.add_argument("--class-count", type=str, action="append", default=[], help="Override per-class count like name=123 (can repeat)")
     parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent.parent / "runs" / "manifest_generated.json")
