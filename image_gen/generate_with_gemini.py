@@ -1,21 +1,10 @@
-import base64
 import io
 import os
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from PIL import Image
 from dotenv import load_dotenv
-
-try:
-    # New SDK (preferred)
-    from google import genai as google_genai
-    HAS_GOOGLE_GENAI = True
-except Exception:
-    HAS_GOOGLE_GENAI = False
-
-import google.generativeai as genai  # Fallback/also used for text prompts
 
 
 def _ensure_api_key() -> str:
@@ -24,75 +13,98 @@ def _ensure_api_key() -> str:
         os.getenv("GOOGLE_API_KEY")
         or os.getenv("GEMINI_API_KEY")
         or os.getenv("GENAI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")  # last-resort fallback if user repurposes var
     )
     if not api_key:
         raise RuntimeError("No Gemini API key found in environment (.env). Use GOOGLE_API_KEY or GEMINI_API_KEY.")
     return api_key
 
 
-def _configure_clients() -> Tuple[Optional[object], object]:
-    api_key = _ensure_api_key()
-    # Configure legacy/official generativeai client
-    genai.configure(api_key=api_key)
-
-    # Configure new SDK if available
-    client = None
-    if HAS_GOOGLE_GENAI:
-        client = google_genai.Client(api_key=api_key)
-    return client, genai
-
-
-def pil_image_to_bytes(img: Image.Image, format: str = "PNG") -> bytes:
+def _placeholder_png() -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format=format)
+    Image.new("RGB", (512, 512), color=(240, 240, 240)).save(buf, format="PNG")
     return buf.getvalue()
 
 
 @dataclass
 class GeminiModels:
-    # You can override these names when calling the functions
-    text_to_image_model: str = "gemini-2.5-pro"  # For reasoning + control
-    image_model: str = "gemini-2.5-pro"  # Using same for image understanding
+    # Default to image-capable Gemini with Imagen fallback
+    text_to_image_model: str = "gemini-2.0-flash-preview-image-generation"
+    imagen_model: str = "imagen-4.0-generate-001"
 
 
-def call_text_to_image(prompt: str, models: GeminiModels = GeminiModels()) -> bytes:
-    client, legacy = _configure_clients()
-
-    # The Gemini SDK does not directly return images for Pro; often image gen is via Imagen APIs.
-    # Here we simulate by asking for a base64 image data URL if supported; otherwise return empty.
-    # Replace with a proper image-gen endpoint when available in your environment.
+def _gemini_generate_image(prompt: str, model_name: str, debug: bool = False) -> Optional[bytes]:
     try:
-        if client is not None:
-            response = client.models.generate_content(
-                model=models.text_to_image_model,
-                contents=[{"role": "user", "parts": [{"text": prompt}]}],
-            )
-            # Try to find an inline image in the response
-            for cand in response.candidates or []:
-                parts = getattr(cand, "content", {}).get("parts", []) if hasattr(cand, "content") else []
-                for part in parts:
-                    data = part.get("inline_data", {}) if isinstance(part, dict) else None
-                    if data and data.get("mime_type", "").startswith("image/"):
-                        return base64.b64decode(data.get("data", ""))
-        # Fallback: ask legacy client for a data URL (depends on your account's enabled features)
-        model = legacy.GenerativeModel(models.text_to_image_model)
-        resp = model.generate_content(prompt)
-        if hasattr(resp, "_result") and isinstance(getattr(resp, "_result", None), dict):
-            # Try to parse imaginary inline image (not standard)
-            pass
-    except Exception:
-        pass
+        from google import genai
+        from google.genai import types
+    except Exception as e:
+        if debug:
+            print(f"[debug] google-genai not available: {e}")
+        return None
 
-    # If no image available, return an empty PNG as a placeholder to keep pipeline working
-    img = Image.new("RGB", (512, 512), color=(240, 240, 240))
-    return pil_image_to_bytes(img)
+    try:
+        client = genai.Client(api_key=_ensure_api_key())
+        if debug:
+            print(f"[debug] gemini generate_content model={model_name}")
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+        )
+        for cand in (resp.candidates or []):
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", []):
+                inline = getattr(part, "inline_data", None)
+                if inline and getattr(inline, "data", None):
+                    return inline.data
+    except Exception as e:
+        if debug:
+            print(f"[debug] gemini error: {e}")
+    return None
 
 
-def call_image_edit(base_image: Image.Image, instruction: str, models: GeminiModels = GeminiModels()) -> bytes:
-    # Structural consistency or domain adaptation can route here.
-    # Currently uses caption + regenerate approach as placeholder.
-    caption = f"Modify the solar panel photo to: {instruction}. Preserve structure and layout."
-    return call_text_to_image(caption, models=models)
+def _imagen_generate_image(prompt: str, model_name: str, debug: bool = False) -> Optional[bytes]:
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as e:
+        if debug:
+            print(f"[debug] google-genai not available: {e}")
+        return None
+
+    try:
+        client = genai.Client(api_key=_ensure_api_key())
+        if debug:
+            print(f"[debug] imagen generate_images model={model_name}")
+        resp = client.models.generate_images(
+            model=model_name,
+            prompt=prompt,
+            config=types.GenerateImagesConfig(number_of_images=1),
+        )
+        if getattr(resp, "generated_images", None):
+            img0 = resp.generated_images[0]
+            if getattr(img0, "image", None) and getattr(img0.image, "image_bytes", None):
+                return img0.image.image_bytes
+    except Exception as e:
+        if debug:
+            print(f"[debug] imagen error: {e}")
+    return None
+
+
+def call_text_to_image(prompt: str, models: GeminiModels = GeminiModels(), debug: bool = False) -> bytes:
+    img = _gemini_generate_image(prompt, models.text_to_image_model, debug=debug)
+    if img:
+        return img
+    img = _imagen_generate_image(prompt, models.imagen_model, debug=debug)
+    if img:
+        return img
+    return _placeholder_png()
+
+
+def call_image_edit(base_image: Image.Image, instruction: str, models: GeminiModels = GeminiModels(), debug: bool = False) -> bytes:
+    # Use descriptive edit prompt; SDK edit endpoints vary by access level
+    prompt = f"{instruction}. Preserve solar panel layout and scene geometry; photorealistic."
+    return call_text_to_image(prompt, models=models, debug=debug)
 
 

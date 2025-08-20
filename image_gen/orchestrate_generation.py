@@ -226,14 +226,15 @@ def main() -> int:
     parser.add_argument("--target-per-class", type=int, default=100)
     parser.add_argument("--classes", type=str, nargs="*", default=CLASS_NAMES)
     parser.add_argument("--models-text", type=str, default="gemini-2.0-flash-preview-image-generation")
-    parser.add_argument("--models-image", type=str, default="gemini-2.0-flash-preview-image-generation")
+    # This flag configures the Imagen fallback model used by our helper
+    parser.add_argument("--models-image", type=str, default="imagen-4.0-generate-001")
     parser.add_argument("--ratio", type=str, default="50,30,20", help="Ratios for SC,DA,T2I in percentages (priority order)")
     parser.add_argument("--class-count", type=str, action="append", default=[], help="Override per-class count like name=123 (can repeat)")
     parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent.parent / "runs" / "manifest_generated.json")
     parser.add_argument("--dry-run", action="store_true", help="Plan only, do not generate images")
     args = parser.parse_args()
 
-    models = GeminiModels(text_to_image_model=args.models_text, image_model=args.models_image)
+    models = GeminiModels(text_to_image_model=args.models_text, imagen_model=args.models_image)
 
     # Parse ratios
     try:
