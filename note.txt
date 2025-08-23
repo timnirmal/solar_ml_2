@@ -1,0 +1,5 @@
+python scripts/create_splits.py --source final_dataset --dest final_dataset_splits --train 0.8 --val 0.1 --test 0.1
+
+
+python training/train_convnext.py --config configs/default.yaml --image_size 1024 --variant tiny
+
