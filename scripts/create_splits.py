@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, List
 
+from PIL import Image
 from tqdm import tqdm
 
 
@@ -37,6 +38,32 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def remove_dir_if_exists(p: Path) -> None:
+    if p.exists():
+        shutil.rmtree(p)
+
+
+def compress_save(src: Path, dst: Path, *, quality: int = 85, convert_to_jpeg: bool = False, max_side: int = 0) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(src) as img:
+        img_format = (img.format or "JPEG").upper()
+        # Optional downscale keeping aspect ratio
+        if max_side and max(img.size) > max_side:
+            scale = max_side / float(max(img.size))
+            new_w = max(1, int(round(img.size[0] * scale)))
+            new_h = max(1, int(round(img.size[1] * scale)))
+            img = img.resize((new_w, new_h), resample=Image.BILINEAR)
+
+        if convert_to_jpeg or img_format not in {"JPEG", "JPG"}:
+            # Convert to JPEG (lossy) for strong size reduction
+            img = img.convert("RGB")
+            dst = dst.with_suffix(".jpg")
+            img.save(dst, format="JPEG", quality=int(quality), optimize=True)
+        else:
+            # Re-encode JPEG with quality/optimize
+            img.save(dst, format="JPEG", quality=int(quality), optimize=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create stratified train/val/test splits from a flat class dataset")
     parser.add_argument("--source", type=Path, default=Path("final_dataset"), help="Source root with class subfolders")
@@ -45,11 +72,18 @@ def main() -> int:
     parser.add_argument("--val", type=float, default=0.1, help="Val ratio")
     parser.add_argument("--test", type=float, default=0.1, help="Test ratio")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--move", action="store_true", help="Move files instead of copying")
+    parser.add_argument("--move", action="store_true", help="Move files instead of copying (ignored if --compress)")
+    parser.add_argument("--compress", action="store_true", help="Re-encode images on write to reduce size")
+    parser.add_argument("--quality", type=int, default=85, help="JPEG quality when --compress (1-100)")
+    parser.add_argument("--convert-to-jpeg", action="store_true", help="Convert any format to JPEG when compressing")
+    parser.add_argument("--max-side", type=int, default=0, help="Optional max side for downscaling when compressing (0=disable)")
     args = parser.parse_args()
 
     if abs((args.train + args.val + args.test) - 1.0) > 1e-6:
         raise ValueError("Ratios must sum to 1.0")
+
+    # Clean destination if exists (fresh run)
+    remove_dir_if_exists(args.dest)
 
     cls_to_paths = list_images_by_class(args.source)
 
@@ -65,10 +99,13 @@ def main() -> int:
                 dst = args.dest / split / cls / src.name
                 if dst.exists():
                     continue
-                if args.move:
-                    shutil.move(str(src), str(dst))
+                if args.compress:
+                    compress_save(src, dst, quality=args.quality, convert_to_jpeg=args.convert_to_jpeg, max_side=args.max_side)
                 else:
-                    shutil.copy2(str(src), str(dst))
+                    if args.move:
+                        shutil.move(str(src), str(dst))
+                    else:
+                        shutil.copy2(str(src), str(dst))
 
     print(f"Wrote splits to {args.dest}")
     return 0
