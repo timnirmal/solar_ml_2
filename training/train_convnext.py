@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from training.letterbox import LetterboxToSquare
 import yaml
 
 # Ensure repo root on sys.path for local imports
@@ -19,8 +18,9 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from datasets.classification_dataset import ClassificationImageFolder
-from models.inception_classifier import InceptionV3SEClassifier
+from models.convnext_classifier import ConvNeXtClassifier
 from training.utils import EarlyStopper, compute_classification_metrics, save_json, set_seed
+from training.letterbox import LetterboxToSquare
 
 
 def build_transforms(image_size: int) -> Dict[str, transforms.Compose]:
@@ -45,7 +45,7 @@ def build_transforms(image_size: int) -> Dict[str, transforms.Compose]:
 
 def create_run_dir(base: Path) -> Path:
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = base / f"run-{ts}"
+    run_dir = base / f"convnext-run-{ts}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -54,6 +54,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--runs_dir", type=str, default="runs")
+    parser.add_argument("--variant", type=str, default="tiny", choices=["tiny", "small", "base", "large"])
+    parser.add_argument("--image_size", type=int, default=896)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -62,7 +64,7 @@ def main() -> None:
     set_seed(int(cfg.get("seed", 42)))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    image_size = int(cfg["training"]["input_size"])  # InceptionV3 default is 299
+    image_size = args.image_size
     tf = build_transforms(image_size)
 
     classes: List[str] = cfg["data"]["classes"]
@@ -85,11 +87,12 @@ def main() -> None:
         pin_memory=True,
     )
 
-    model = InceptionV3SEClassifier(
+    model = ConvNeXtClassifier(
         num_classes=len(classes),
+        variant=args.variant,
         pretrained=bool(cfg["model"]["pretrained"]),
         dropout=float(cfg["model"]["dropout"]),
-        freeze_until=cfg["model"]["freeze_until"],
+        freeze_until=None,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -154,6 +157,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 

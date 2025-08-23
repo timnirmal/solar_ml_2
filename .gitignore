@@ -10,3 +10,15 @@ __pycache__/
 *.pyd
 *.pyw
 *.pyz
+
+final_dataset/
+final_dataset_splits/
+residue/
+
+*.zip
+
+
+
+
+
+

@@ -1,0 +1,442 @@
+got it. since your data is **folder-per-class (`final_dataset/<class>/*.jpg`)** (500 each), you can:
+
+* **Train a strong image‐level classifier (ConvNeXt)** immediately.
+* **Optionally get a detector (YOLOv11)** by *auto-generating pseudo-boxes* from the classifier via Grad-CAM, then train YOLO on those boxes, and use **YOLO → ConvNeXt** at inference.
+
+Below is a complete, runnable plan with scripts.
+
+---
+
+# 0) Environment
+
+```bash
+# Python 3.10–3.11
+pip install torch torchvision timm scikit-learn opencv-python numpy matplotlib \
+            tqdm albumentations pytorch-grad-cam ultralytics==8.3.0
+```
+
+---
+
+# 1) Project layout
+
+```
+project/
+  final_dataset/                 # given
+    clean/*.jpg
+    dusty/*.jpg
+    bird_drop/*.jpg
+    snow_covered/*.jpg
+    physical_damage/*.jpg
+    electrical_damage/*.jpg
+
+  data/                          # will be created
+    cls/
+      train/<class>/*.jpg
+      val/<class>/*.jpg
+      test/<class>/*.jpg
+    det/
+      images/train/*.jpg
+      images/val/*.jpg
+      annotations/instances_train.json
+      annotations/instances_val.json
+
+  models/
+    convnext_cls.pt
+    convnext_meta.json
+    yolo/
+```
+
+---
+
+# 2) Split dataset (stratified 80/10/10)
+
+```python
+# split_dataset.py
+import os, random, shutil
+from pathlib import Path
+random.seed(1337)
+
+SRC = Path("final_dataset")
+DST = Path("data/cls")
+splits = {"train":0.8, "val":0.1, "test":0.1}
+
+def main():
+    for s in splits:
+        for c in os.listdir(SRC):
+            (DST/s/c).mkdir(parents=True, exist_ok=True)
+
+    for c in sorted(os.listdir(SRC)):
+        imgs = sorted([p for p in (SRC/c).glob("*") if p.suffix.lower() in [".jpg",".jpeg",".png"]])
+        n = len(imgs)
+        n_train = int(n*splits["train"])
+        n_val   = int(n*splits["val"])
+        idx = list(range(n)); random.shuffle(idx)
+        parts = {
+            "train": [imgs[i] for i in idx[:n_train]],
+            "val":   [imgs[i] for i in idx[n_train:n_train+n_val]],
+            "test":  [imgs[i] for i in idx[n_train+n_val:]],
+        }
+        for s, files in parts.items():
+            for f in files:
+                shutil.copy2(f, DST/s/c/f.name)
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+python split_dataset.py
+```
+
+---
+
+# 3) Train ConvNeXt classifier (stage-1)
+
+```python
+# train_convnext.py
+import os, json, time
+import timm, torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.metrics import classification_report, confusion_matrix
+import numpy as np
+
+DATA_DIR = "data/cls"
+CKPT = "models/convnext_cls.pt"
+META = "models/convnext_meta.json"
+IMG = 256
+BATCH = 64
+EPOCHS = 40
+LR = 3e-4
+MODEL_NAME = "convnext_small.fb_in22k"   # or convnext_tiny
+
+tfm_train = transforms.Compose([
+    transforms.Resize(int(IMG*1.15)),
+    transforms.CenterCrop(IMG),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.2,0.2,0.2,0.05),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+tfm_eval = transforms.Compose([
+    transforms.Resize(IMG),
+    transforms.CenterCrop(IMG),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+def make_loader(split, train=False):
+    ds = datasets.ImageFolder(os.path.join(DATA_DIR, split), transform=(tfm_train if train else tfm_eval))
+    dl = DataLoader(ds, batch_size=BATCH, shuffle=train, num_workers=8, pin_memory=True)
+    return ds, dl
+
+def evaluate(model, dl, device):
+    model.eval()
+    ys, ps = [], []
+    with torch.no_grad(), autocast():
+        for x,y in dl:
+            x,y = x.to(device), y.to(device)
+            logits = model(x)
+            ys.append(y.cpu().numpy())
+            ps.append(logits.softmax(1).argmax(1).cpu().numpy())
+    y = np.concatenate(ys); p = np.concatenate(ps)
+    acc = (y==p).mean()
+    return acc, y, p
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_ds, train_dl = make_loader("train", True)
+    val_ds,   val_dl   = make_loader("val", False)
+    ncls = len(train_ds.classes)
+
+    model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=ncls).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimz = optim.AdamW(model.parameters(), lr=LR, weight_decay=0.05)
+    sched  = optim.CosineAnnealingLR(optimz, T_max=EPOCHS)
+    scaler = GradScaler()
+
+    best = 0.0
+    for ep in range(EPOCHS):
+        model.train()
+        for x,y in train_dl:
+            x,y = x.to(device), y.to(device)
+            optimz.zero_grad(set_to_none=True)
+            with autocast():
+                loss = criterion(model(x), y)
+            scaler.scale(loss).backward()
+            scaler.step(optimz); scaler.update()
+        sched.step()
+
+        acc, y, p = evaluate(model, val_dl, device)
+        print(f"Epoch {ep+1}/{EPOCHS}  val_acc={acc:.4f}")
+        if acc>best:
+            best = acc
+            os.makedirs("models", exist_ok=True)
+            torch.save({"model":model.state_dict(), "model_name":MODEL_NAME}, CKPT)
+            with open(META,"w") as f:
+                json.dump({"classes":train_ds.classes}, f, indent=2)
+
+    # final test report
+    test_ds, test_dl = make_loader("test", False)
+    ckpt = torch.load(CKPT, map_location=device)
+    model = timm.create_model(ckpt["model_name"], pretrained=False, num_classes=len(train_ds.classes)).to(device)
+    model.load_state_dict(ckpt["model"]); model.eval()
+    acc, y, p = evaluate(model, test_dl, device)
+    print("TEST acc:", acc)
+    print(classification_report(y, p, target_names=test_ds.classes))
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+python train_convnext.py
+```
+
+This gives you a strong **panel-level classifier** immediately.
+
+---
+
+# 4) (Optional) Auto-label boxes from Grad-CAM → train YOLO (stage-2)
+
+## 4.1 Generate pseudo-boxes with Grad-CAM
+
+```python
+# make_pseudo_boxes.py
+from pathlib import Path
+import json, cv2, torch, timm, numpy as np
+from torchvision import transforms
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+IMG = 256
+DATA_ROOT = Path("data/cls/train")   # use train and val to build det/train & det/val
+OUT_ROOT  = Path("data/det")
+CKPT      = "models/convnext_cls.pt"
+META      = "models/convnext_meta.json"
+THR = 0.35         # CAM threshold (0..1)
+MIN_BOX = 16       # min side in pixels to keep
+
+tfm = transforms.Compose([
+  transforms.Resize(IMG), transforms.CenterCrop(IMG),
+  transforms.ToTensor(),
+  transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+def largest_bbox(mask):
+    # return x,y,w,h from binary mask
+    contours, _ = cv2.findContours((mask>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    x,y,w,h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+    return [x,y,w,h]
+
+def run_split(split):
+    imgs_dir = OUT_ROOT/"images"/split
+    ann_path = OUT_ROOT/"annotations"/f"instances_{split}.json"
+    imgs_dir.mkdir(parents=True, exist_ok=True); (OUT_ROOT/"annotations").mkdir(parents=True, exist_ok=True)
+
+    with open(META) as f: classes = json.load(f)["classes"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt = torch.load(CKPT, map_location=device)
+    model = timm.create_model(ckpt["model_name"], pretrained=False, num_classes=len(classes)).to(device)
+    model.load_state_dict(ckpt["model"]); model.eval()
+    target_layers = [list(model.children())[-1]]  # last block works for convnext in timm
+    cam = GradCAM(model=model, target_layers=target_layers, use_cuda=(device=="cuda"))
+
+    images, annotations, categories = [], [], [{"id":i+1,"name":c} for i,c in enumerate(classes)]
+    img_id=1; ann_id=1
+    for cidx, cname in enumerate(classes):
+        for p in (Path("data/cls")/split/cname).glob("*"):
+            bgr = cv2.imread(str(p)); h0,w0 = bgr.shape[:2]
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            x = tfm(rgb).unsqueeze(0).to(device)
+            targets=[ClassifierOutputTarget(cidx)]
+            grayscale_cam = cam(input_tensor=x, targets=targets, eigen_smooth=True)[0]
+            cam_resized = cv2.resize(grayscale_cam, (w0,h0))
+            mask = (cam_resized >= THR).astype(np.uint8)
+            bbox = largest_bbox(mask)
+            if bbox is None: 
+                # fallback: whole image
+                bbox = [0,0,w0,h0]
+            x,y,w,h = bbox
+            if min(w,h) < MIN_BOX:
+                # expand a bit
+                pad = int(0.05*min(h0,w0))
+                x = max(0,x-pad); y=max(0,y-pad)
+                w = min(w0-x, w+2*pad); h = min(h0-y, h+2*pad)
+
+            # copy image
+            dst = imgs_dir/f"{img_id:07d}.jpg"
+            cv2.imwrite(str(dst), bgr)
+
+            images.append({"id":img_id,"file_name":dst.name,"height":h0,"width":w0})
+            annotations.append({"id":ann_id,"image_id":img_id,"category_id":cidx+1,
+                                "bbox":[float(x),float(y),float(w),float(h)],
+                                "area":float(w*h),"iscrowd":0})
+            img_id+=1; ann_id+=1
+
+    coco = {"images":images,"annotations":annotations,"categories":categories}
+    with open(ann_path,"w") as f: json.dump(coco,f)
+    print("wrote", ann_path)
+
+if __name__=="__main__":
+    run_split("train")
+    run_split("val")
+```
+
+Run:
+
+```bash
+python make_pseudo_boxes.py
+```
+
+This yields COCO annotations from CAM blobs (weak supervision).
+
+## 4.2 Train YOLOv11 on pseudo-boxes
+
+Create YAML:
+
+```yaml
+# solar.yaml
+path: data/det
+train: images/train
+val: images/val
+nc: 6
+names: [clean, dusty, bird_drop, snow_covered, physical_damage, electrical_damage]
+```
+
+Train (square→rect schedule):
+
+```bash
+# stage A
+yolo detect train model=yolo11s.pt data=solar.yaml imgsz=1280 epochs=120 batch=16 \
+  warmup_epochs=5 mosaic=1.0 mixup=0.1 copy_paste=0.5 hsv_h=0.015 hsv_s=0.7 hsv_v=0.4 \
+  translate=0.08 scale=0.4 fliplr=0.5 erasing=0.2 close_mosaic=15
+
+# stage B (rectangular fine-tune)
+yolo detect train model=runs/detect/train/weights/best.pt data=solar.yaml imgsz=1280 \
+  epochs=30 lr0=0.0008 lrf=0.1 mosaic=0.0 mixup=0.0 copy_paste=0.2 rect=True
+```
+
+Validate:
+
+```bash
+yolo detect val model=runs/detect/train2/weights/best.pt data=solar.yaml imgsz=1280 rect=True
+```
+
+---
+
+# 5) Inference (pipeline)
+
+* If you only need **panel-level** prediction → use the classifier directly.
+* If you trained YOLO, do **YOLO → crop → ConvNeXt** and output annotated images + JSON.
+
+```python
+# infer_pipeline.py
+import os, json, cv2, torch, timm
+from torchvision import transforms
+from ultralytics import YOLO
+from pathlib import Path
+
+CLS_CKPT = "models/convnext_cls.pt"
+CLS_META = "models/convnext_meta.json"
+YOLO_W   = "runs/detect/train2/weights/best.pt"   # or set to None for classifier-only
+IMG_DIR  = "in_images"
+OUT_DIR  = "out"
+MARGIN   = 0.08
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# classifier
+with open(CLS_META) as f: classes = json.load(f)["classes"]
+ckpt = torch.load(CLS_CKPT, map_location=device)
+model = timm.create_model(ckpt["model_name"], pretrained=False, num_classes=len(classes)).to(device)
+model.load_state_dict(ckpt["model"]); model.eval()
+tfm = transforms.Compose([
+  transforms.Resize(256), transforms.CenterCrop(256),
+  transforms.ToTensor(), transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+# detector (optional)
+det = YOLO(YOLO_W) if os.path.exists(YOLO_W) else None
+
+def classify(bgr):
+    import numpy as np
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    x = tfm(rgb).unsqueeze(0).to(device)
+    with torch.no_grad():
+        p = model(x).softmax(1)[0].cpu().numpy()
+    idx = int(p.argmax()); return classes[idx], float(p[idx])
+
+def run_one(img_path):
+    im = cv2.imread(str(img_path)); H,W = im.shape[:2]
+    results = []
+    if det is not None:
+        res = det.predict(source=str(img_path), imgsz=1280, conf=0.2, iou=0.5, verbose=False)[0]
+        for b in res.boxes:
+            x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+            dx = int((x2-x1)*MARGIN); dy=int((y2-y1)*MARGIN)
+            xa=max(0,x1-dx); ya=max(0,y1-dy); xb=min(W,x2+dx); yb=min(H,y2+dy)
+            crop = im[ya:yb, xa:xb]
+            lab,score = classify(crop)
+            results.append({"bbox":[x1,y1,x2,y2],"label":lab,"score":score})
+            # draw
+            cv2.rectangle(im,(x1,y1),(x2,y2),(0,255,0),2)
+            txt=f"{lab} {score:.2f}"
+            (tw,th),_=cv2.getTextSize(txt,cv2.FONT_HERSHEY_SIMPLEX,0.6,2)
+            cv2.rectangle(im,(x1,y1-th-6),(x1+tw+6,y1),(0,255,0),-1)
+            cv2.putText(im,txt,(x1+3,y1-4),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,0),2,cv2.LINE_AA)
+    else:
+        # classifier-only
+        lab,score = classify(im)
+        results.append({"bbox":[0,0,W,H],"label":lab,"score":score})
+        cv2.putText(im,f"{lab} {score:.2f}",(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,0),2,cv2.LINE_AA)
+
+    out_img = Path(OUT_DIR)/Path(img_path).name
+    cv2.imwrite(str(out_img), im)
+    return str(out_img), results
+
+def main():
+    allres=[]
+    for p in sorted(Path(IMG_DIR).glob("*")):
+        if p.suffix.lower() not in [".jpg",".jpeg",".png"]: continue
+        out_img, res = run_one(p)
+        allres.append({"image":str(p),"output":out_img,"detections":res})
+    with open(Path(OUT_DIR)/"results.json","w") as f:
+        json.dump(allres,f,indent=2)
+    print("Saved outputs to", OUT_DIR)
+
+if __name__=="__main__":
+    main()
+```
+
+Run:
+
+```bash
+python infer_pipeline.py
+```
+
+---
+
+# 6) What you’ll get
+
+* **Now**: a high-accuracy **panel-level classifier** (`models/convnext_cls.pt`)—works with your folder-per-class dataset out of the box.
+* **Optional later**: a detector trained from **pseudo-boxes** (`runs/detect/.../best.pt`) enabling **YOLO → ConvNeXt** pipeline.
+
+---
+
+## Practical notes
+
+* Your images are mainly **1024×1024** and **1024×(570–690)**. Train YOLO with `imgsz=1280`, finish with `rect=True`. If the smallest defects are tiny (<10 px at 1280), either move to **imgsz=1536** or add **tile inference** later.
+* CAM pseudo-boxes are weak labels; they’ll still give a *useful* detector for localization and speed. If you later annotate 200–300 real boxes with CVAT/Label Studio, fine-tune YOLO once more to jump in quality.
+* Keep class names **identical** across classifier and detector.
+
+If you want, I can also add a **tile-inference helper** and an **evaluation script** that reports (detector recall, classifier accuracy on YOLO crops, and end-to-end latency).

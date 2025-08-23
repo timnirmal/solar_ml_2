@@ -3,21 +3,21 @@ runs_dir: runs
 project_name: solar_fault_detection
 
 data:
-  classification_root: data/classification
+  classification_root: final_dataset_splits
   train_split: train
   val_split: val
   test_split: test
   classes:
     - clean
     - dusty
-    - bird-drop
-    - electrical-damage
-    - physical-damage
-    - snow-covered
+    - bird_drop
+    - electrical_damage
+    - physical_damage
+    - snow_covered
 
 training:
   input_size: 299
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   max_epochs: 30
   lr: 3.0e-4
