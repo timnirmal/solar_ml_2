@@ -13,10 +13,15 @@ __pycache__/
 
 final_dataset/
 final_dataset_splits/
+final_dataset_splits_small/
 residue/
+yolo_labels/
+
+note.txt
 
 *.zip
 
+cam_overlays/
 
 
 

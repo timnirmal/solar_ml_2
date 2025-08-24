@@ -1,5 +1,7 @@
-python scripts/create_splits.py --source final_dataset --dest final_dataset_splits --train 0.8 --val 0.1 --test 0.1
+python scripts/create_splits.py --source final_dataset --dest final_dataset_splits --train 0.8 --val 0.1 --test 0.1 --compress --quality 85 --convert-to-jpeg --max-side 1024
 
 
 python training/train_convnext.py --config configs/default.yaml --image_size 1024 --variant tiny
+
+pip install pyyaml tqdm Pillow tabulate rich PyMuPDF pdfminer.six python-dotenv google-genai google-generativeai matplotlib pandas tensorboard tqdm
 

@@ -8,6 +8,10 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 import yaml
@@ -64,6 +68,9 @@ def main() -> None:
     set_seed(int(cfg.get("seed", 42)))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        cudnn.benchmark = True
+    scaler = GradScaler(device="cuda", enabled=(device.type == "cuda"))
     image_size = args.image_size
     tf = build_transforms(image_size)
 
@@ -101,6 +108,7 @@ def main() -> None:
 
     run_dir = create_run_dir(Path(args.runs_dir))
     save_json(cfg, run_dir / "config.json")
+    writer = SummaryWriter(log_dir=str(run_dir))
 
     stopper = EarlyStopper(patience=int(cfg["training"]["early_stopping_patience"]))
     best_val_f1 = -1.0
@@ -108,24 +116,30 @@ def main() -> None:
     for epoch in range(int(cfg["training"]["max_epochs"])):
         model.train()
         total_loss = 0.0
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            logits = model(images)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * images.size(0)
+        pbar = tqdm(train_loader, desc=f"train[{epoch}]", leave=False)
+        for images, labels in pbar:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                logits = model(images)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += float(loss.detach()) * images.size(0)
+            pbar.set_postfix({"loss": f"{float(loss.detach()):.4f}"})
 
         model.eval()
         y_true: List[int] = []
         y_pred: List[int] = []
         with torch.no_grad():
-            for images, labels in val_loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                logits = model(images)
+            pbarv = tqdm(val_loader, desc=f"val[{epoch}]", leave=False)
+            for images, labels in pbarv:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                    logits = model(images)
                 preds = torch.argmax(logits, dim=1)
                 y_true.extend(labels.cpu().tolist())
                 y_pred.extend(preds.cpu().tolist())
@@ -140,6 +154,11 @@ def main() -> None:
             "lr": optimizer.param_groups[0]["lr"],
         }
         print(log)
+        # TensorBoard scalars
+        writer.add_scalar("loss/train", epoch_loss, epoch)
+        writer.add_scalar("metrics/accuracy", metrics["accuracy"], epoch)
+        writer.add_scalar("metrics/macro_f1", metrics["macro_f1"], epoch)
+        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
         save_json(log, run_dir / f"epoch-{epoch:03d}.json")
 
         if metrics["macro_f1"] > best_val_f1:
@@ -153,6 +172,7 @@ def main() -> None:
         scheduler.step()
 
     torch.save(model.state_dict(), run_dir / "last.pt")
+    writer.close()
 
 
 if __name__ == "__main__":
