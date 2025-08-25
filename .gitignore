@@ -22,8 +22,9 @@ note.txt
 *.zip
 
 cam_overlays/
+labled_data/
 
-
+yolo11n.pt
 
 
 
